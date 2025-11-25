@@ -118,7 +118,8 @@ class EasynewsClient:
 
         r = self.s.get(full_url)
         r.raise_for_status()
-        return r.json()
+        # The API returns Content-Type: text/html but the content is JSON
+        return json.loads(r.text)
 
     @staticmethod
     def _collect_items(json_data: Dict[str, Any]) -> List[SearchItem]:
