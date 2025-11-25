@@ -10,6 +10,11 @@ from urllib.parse import quote
 
 from flask import Flask, Response, jsonify, request
 import json
+import logging
+
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 from easynews_client import EasynewsClient, EasynewsError, SearchItem
 
@@ -122,6 +127,8 @@ def _normalize_title(raw: str) -> str:
     text = html.unescape(raw or "").strip()
     if not text:
         return text
+    # Replace underscores and dots with spaces
+    text = text.replace("_", " ").replace(".", " ")
     matches = _TITLE_PARENS_RE.findall(text)
     for candidate in reversed(matches):
         cleaned = candidate.strip()
@@ -185,6 +192,7 @@ _STOPWORDS = {
     "in",
     "for",
     "on",
+    "series",
 }
 
 _MIN_DURATION_SECONDS = 60
@@ -249,6 +257,30 @@ def _tokenize(text: str) -> List[str]:
     return tokens
 
 
+def _clean_query_for_easynews(raw_query: str) -> str:
+    """
+    Cleans a raw query string for Easynews Global Search 2.0.
+    - Removes common stopwords.
+    - Strips special characters (non-alphanumeric).
+    """
+    if not raw_query:
+        return ""
+
+    # Remove stopwords
+    words = raw_query.lower().split()
+    filtered_words = [word for word in words if word not in _STOPWORDS]
+    cleaned_query = " ".join(filtered_words)
+
+    # Strip special characters (non-alphanumeric)
+    # Reuse _NON_ALNUM_RE for this
+    cleaned_query = _NON_ALNUM_RE.sub(" ", cleaned_query).strip()
+
+    # Remove extra spaces
+    cleaned_query = re.sub(r'\s+', ' ', cleaned_query).strip()
+
+    return cleaned_query
+
+
 def _sanitize_phrase(text: str) -> str:
     if not text:
         return ""
@@ -308,6 +340,22 @@ def _extract_quality(*texts: Optional[str]) -> Optional[str]:
     return None
 
 
+def _get_newznab_category_id(t_param: str, quality: Optional[str]) -> int:
+    """
+    Determines the Newznab category ID based on search type and item quality.
+    """
+    if t_param == "movie":
+        return 2000  # Movies
+    elif t_param == "tvsearch":
+        if quality:
+            # Check for common HD resolutions
+            lowered_quality = quality.lower()
+            if any(res in lowered_quality for res in ["1080p", "720p", "2160p", "4k", "uhd", "fhd"]):
+                return 5040  # HD TV
+        return 5030  # SD TV (default if no quality or non-HD)
+    return 2000  # Default to Movies if type is unknown
+
+
 def _build_thumbnail_url(base: Optional[str], hash_id: Optional[str], slug: Optional[str]) -> Optional[str]:
     if not base or not hash_id:
         return None
@@ -346,14 +394,11 @@ def _matches_strict(title: str, strict_phrase: Optional[str]) -> bool:
         return False
     if candidate == strict_phrase:
         return True
-    candidate_tokens = candidate.split()
-    phrase_tokens = strict_phrase.split()
+    candidate_tokens = set(candidate.split())
+    phrase_tokens = set(strict_phrase.split())
     if not phrase_tokens:
         return True
-    for idx in range(0, max(1, len(candidate_tokens) - len(phrase_tokens) + 1)):
-        if candidate_tokens[idx : idx + len(phrase_tokens)] == phrase_tokens:
-            return True
-    return False
+    return phrase_tokens.issubset(candidate_tokens)
 
 
 def filter_and_map(
@@ -554,6 +599,7 @@ def api():
 
         search_label = " ".join(part for part in search_components if part).strip()
         raw_query = search_label or base_query
+        raw_query = _clean_query_for_easynews(raw_query)  # Apply cleaning here
         q = raw_query.strip()
         fallback_query = False
         if not q or q.lower() == "test":  # allow Prowlarr validation calls to receive data
@@ -568,7 +614,7 @@ def api():
         if episode_int is not None:
             query_meta["episode"] = episode_int
         strict_param = request.args.get("strict")
-        strict_requested = t == "movie"
+        strict_requested = t == "movie"  # Revert to only strict for movies
         if strict_param is not None:
             strict_requested = strict_param.strip().lower() not in {"0", "false", "no", "off"}
         strict_phrase = _sanitize_phrase(raw_query) if strict_requested else None
@@ -616,7 +662,14 @@ def api():
         # Trim by limit (handles fallback and real queries)
         items = items[offset : offset + limit]
 
-        display_q = raw_query if raw_query else q
+        display_q = raw_query if raw_query else q  # Moved this line up
+
+        if items:
+            logger.info(f"Found {len(items)} items for query '{display_q}':")
+            for item in items:
+                logger.info(f"  - {item.get('title')} (Quality: {item.get('quality')}, Year: {item.get('year')})")
+        else:
+            logger.info(f"No items found for query '{display_q}'")
         chan_title = f"Results for {display_q}"
         now_dt = datetime.now(timezone.utc)
         channel_pub = now_dt.strftime("%a, %d %b %Y %H:%M:%S %z")
@@ -649,9 +702,10 @@ def api():
             year = it.get("year")
             season = it.get("season")
             episode = it.get("episode")
+            category_id = _get_newznab_category_id(t, quality)
             attr_parts = [
                 f"<newznab:attr name=\"size\" value=\"{size}\"/>",
-                f"<newznab:attr name=\"category\" value=\"2000\"/>",
+                f"<newznab:attr name=\"category\" value=\"{category_id}\"/>",
                 f"<newznab:attr name=\"usenetdate\" value=\"{posted_str}\"/>",
                 f"<newznab:attr name=\"posted\" value=\"{posted_epoch}\"/>",
             ]
